@@ -16,6 +16,7 @@ from module.download_stat import (
     get_total_download_speed,
     set_download_state,
 )
+from module.runtime_health import runtime_health
 from utils.crypto import AesBase64
 from utils.format import format_byte
 
@@ -175,6 +176,20 @@ def web_set_download_state():
 def get_app_version():
     """Get telegram_media_downloader version"""
     return utils.__version__
+
+
+@_flask_app.route("/healthz")
+def healthz():
+    """Liveness endpoint for process supervisors."""
+    snapshot = runtime_health.snapshot()
+    return jsonify(snapshot), 200 if snapshot["healthy"] else 503
+
+
+@_flask_app.route("/readyz")
+def readyz():
+    """Readiness endpoint; FloodWait/backoff reports unavailable."""
+    snapshot = runtime_health.snapshot()
+    return jsonify(snapshot), 200 if snapshot["ready"] else 503
 
 
 @_flask_app.route("/get_download_list")

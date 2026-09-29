@@ -1,5 +1,6 @@
 """Downloads media from telegram."""
 import asyncio
+import itertools
 import logging
 import os
 import shutil
@@ -12,8 +13,8 @@ from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
 from rich.logging import RichHandler
 
 from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
-from module.bot import start_download_bot, stop_download_bot
-from module.download_stat import update_download_status
+from module.bot import get_download_bot_client, start_download_bot, stop_download_bot
+from module.download_stat import cleanup_download_result, update_download_status
 from module.get_chat_history_v2 import get_chat_history_v2
 from module.language import _t
 from module.pyrogram_extension import (
@@ -27,6 +28,7 @@ from module.pyrogram_extension import (
     update_cloud_upload_stat,
     upload_telegram_chat,
 )
+from module.runtime_health import create_supervised_task, runtime_health
 from module.web import init_web
 from utils.format import truncate_filename, validate_title
 from utils.log import LogFilter
@@ -45,7 +47,12 @@ DATA_FILE_NAME = "data.yaml"
 APPLICATION_NAME = "media_downloader"
 app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 
-queue: asyncio.Queue = asyncio.Queue()
+DOWNLOAD_QUEUE_MAXSIZE = 100
+BULK_DOWNLOAD_PRIORITY = 10
+MAX_INLINE_FLOOD_WAIT = 30
+queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAXSIZE)
+_queue_sequence = itertools.count()
+_initial_state_compacted = False
 RETRY_TIME_OUT = 3
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
@@ -258,13 +265,16 @@ async def _get_media_meta(
 async def add_download_task(
     message: pyrogram.types.Message,
     node: TaskNode,
+    priority: int = BULK_DOWNLOAD_PRIORITY,
 ):
-    """Add Download task"""
+    """Add a bounded download task with backpressure."""
     if message.empty:
         return False
+
     node.download_status[message.id] = DownloadStatus.Downloading
-    await queue.put((message, node))
+    await queue.put((priority, next(_queue_sequence), message, node))
     node.total_task += 1
+    runtime_health.set_queue_size(queue.qsize())
     return True
 
 
@@ -298,51 +308,95 @@ async def save_msg_to_file(
 async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
 ):
-    """Download and Forward media"""
+    """Download one message and always close its accounting state."""
 
-    download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
-    )
+    download_status = DownloadStatus.FailedDownload
+    file_name: Optional[str] = None
+    file_size = 0
 
-    if app.enable_download_txt and message.text and not message.media:
-        download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
+    try:
+        download_status, file_name = await download_media(
+            client, message, app.media_types, app.file_formats, node
+        )
 
-    if not node.bot:
-        app.set_download_id(node, message.id, download_status)
+        if app.enable_download_txt and message.text and not message.media:
+            download_status, file_name = await save_msg_to_file(
+                app, node.chat_id, message
+            )
 
-    node.download_status[message.id] = download_status
+        node.download_status[message.id] = download_status
+        file_size = os.path.getsize(file_name) if file_name else 0
 
-    file_size = os.path.getsize(file_name) if file_name else 0
+        try:
+            await upload_telegram_chat(
+                client,
+                node.upload_user if node.upload_user else client,
+                app,
+                node,
+                message,
+                download_status,
+                file_name,
+            )
 
-    await upload_telegram_chat(
-        client,
-        node.upload_user if node.upload_user else client,
-        app,
-        node,
-        message,
-        download_status,
-        file_name,
-    )
+            if (
+                file_name
+                and not node.upload_telegram_chat_id
+                and download_status is DownloadStatus.SuccessDownload
+            ):
+                ui_file_name = file_name
+                if app.hide_file_name:
+                    ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
+                if await app.upload_file(
+                    file_name,
+                    update_cloud_upload_stat,
+                    (node, message.id, ui_file_name),
+                ):
+                    node.upload_success_count += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception(
+                "Post-download processing failed for message {}: {}",
+                message.id,
+                exc,
+            )
+            runtime_health.record_error(
+                f"post-download message {message.id}: {exc}"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        download_status = DownloadStatus.FailedDownload
+        file_name = None
+        logger.exception("Download task {} failed: {}", message.id, exc)
+        runtime_health.record_error(f"download message {message.id}: {exc}")
+    finally:
+        node.download_status[message.id] = download_status
 
-    # rclone upload
-    if (
-        not node.upload_telegram_chat_id
-        and download_status is DownloadStatus.SuccessDownload
-    ):
-        ui_file_name = file_name
-        if app.hide_file_name:
-            ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-        if await app.upload_file(
-            file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
-        ):
-            node.upload_success_count += 1
+        if not node.bot:
+            try:
+                app.set_download_id(node, message.id, download_status)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Failed to finalize message {}: {}", message.id, exc)
+                runtime_health.record_error(
+                    f"finalize message {message.id}: {exc}"
+                )
 
-    await report_bot_download_status(
-        node.bot,
-        node,
-        download_status,
-        file_size,
-    )
+        try:
+            await report_bot_download_status(
+                node.bot,
+                node,
+                download_status,
+                file_size,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception(
+                "Failed to report status for message {}: {}", message.id, exc
+            )
+
+        runtime_health.mark_worker_progress()
 
 
 # pylint: disable = R0915,R0914
@@ -396,6 +450,9 @@ async def download_media(
     media_size = 0
     _media = None
     message = await fetch_message(client, message)
+    if not message:
+        return DownloadStatus.FailedDownload, None
+
     try:
         for _type in media_types:
             _media = getattr(message, _type, None)
@@ -462,7 +519,10 @@ async def download_media(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
             )
             await asyncio.sleep(RETRY_TIME_OUT)
-            message = await fetch_message(client, message)
+            refreshed_message = await fetch_message(client, message)
+            if not refreshed_message:
+                break
+            message = refreshed_message
             if _check_timeout(retry, message.id):
                 # pylint: disable = C0301
                 logger.error(
@@ -470,8 +530,13 @@ async def download_media(
                     f"{_t('file reference expired for 3 retries, download skipped.')}"
                 )
         except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
-            await asyncio.sleep(wait_err.value)
             logger.warning("Message[{}]: FlowWait {}", message.id, wait_err.value)
+            if wait_err.value > MAX_INLINE_FLOOD_WAIT:
+                runtime_health.record_error(
+                    f"download FloodWait {wait_err.value}s for message {message.id}"
+                )
+                break
+            await asyncio.sleep(wait_err.value)
             _check_timeout(retry, message.id)
         except TypeError:
             # pylint: disable = C0301
@@ -520,22 +585,51 @@ def _check_config() -> bool:
 
 
 async def worker(client: pyrogram.client.Client):
-    """Work for download task"""
+    """Work for download task."""
     while app.is_running:
         try:
             item = await queue.get()
-            message = item[0]
-            node: TaskNode = item[1]
+        except asyncio.CancelledError:
+            raise
+
+        transfer_started = False
+        try:
+            if len(item) == 4:
+                _, _, message, node = item
+            else:
+                message, node = item
 
             if node.is_stop_transmission:
+                node.download_status[message.id] = DownloadStatus.SkipDownload
+                if not node.bot:
+                    app.set_download_id(
+                        node, message.id, DownloadStatus.SkipDownload
+                    )
+                await report_bot_download_status(
+                    node.bot,
+                    node,
+                    DownloadStatus.SkipDownload,
+                )
+                runtime_health.mark_worker_progress()
                 continue
 
+            runtime_health.download_started()
+            transfer_started = True
             if node.client:
                 await download_task(node.client, message, node)
             else:
                 await download_task(client, message, node)
-        except Exception as e:
-            logger.exception(f"{e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Worker error: {}", exc)
+            runtime_health.record_error(f"worker: {exc}")
+        finally:
+            if transfer_started:
+                runtime_health.download_finished()
+            if hasattr(queue, "task_done"):
+                queue.task_done()
+            runtime_health.set_queue_size(queue.qsize())
 
 
 async def download_chat_task(
@@ -544,6 +638,8 @@ async def download_chat_task(
     node: TaskNode,
 ):
     """Download all task"""
+    node.is_running = True
+    node.collection_complete = False
     messages_iter = get_chat_history_v2(
         client,
         node.chat_id,
@@ -597,6 +693,7 @@ async def download_chat_task(
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
+    node.collection_complete = True
     node.is_running = True
 
 
@@ -610,6 +707,89 @@ async def download_all_chat(client: pyrogram.Client):
             logger.warning(f"Download {key} error: {e}")
         finally:
             value.need_check = True
+            value.node.collection_complete = True
+
+
+def _compact_finished_initial_state():
+    """Persist completed initial scans and release their success-only state."""
+    # pylint: disable=global-statement
+    global _initial_state_compacted
+    if _initial_state_compacted or not app.chat_download_config:
+        return
+
+    all_finished = all(
+        value.need_check and value.total_task == value.finish_task
+        for value in app.chat_download_config.values()
+    )
+    if not all_finished:
+        return
+
+    app.update_config()
+    terminal_status = (
+        DownloadStatus.SuccessDownload,
+        DownloadStatus.SkipDownload,
+    )
+    for value in app.chat_download_config.values():
+        value.node.download_status = {
+            message_id: status
+            for message_id, status in value.node.download_status.items()
+            if status not in terminal_status
+        }
+        value.node.upload_stat_dict.clear()
+        value.node.cloud_drive_upload_stat_dict.clear()
+
+    _initial_state_compacted = True
+
+
+async def health_monitor(client: pyrogram.Client):
+    """Probe Telegram RPC liveness and clean bounded runtime state."""
+    while app.is_running:
+        runtime_health.set_queue_size(queue.qsize())
+
+        try:
+            await asyncio.wait_for(client.get_me(), timeout=15)
+            runtime_health.mark_user_rpc_ok()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            runtime_health.record_error(f"user client health: {exc}")
+            logger.warning("User client health check failed: {}", exc)
+
+        if app.bot_token:
+            bot_client = get_download_bot_client()
+            if bot_client:
+                dispatcher = getattr(bot_client, "dispatcher", None)
+                dispatcher_tasks = getattr(
+                    dispatcher, "handler_worker_tasks", []
+                )
+                dispatcher_alive = (
+                    bool(getattr(bot_client, "is_connected", False))
+                    and bool(getattr(bot_client, "is_initialized", False))
+                    and bool(dispatcher_tasks)
+                    and all(not task.done() for task in dispatcher_tasks)
+                )
+                if dispatcher_alive:
+                    runtime_health.mark_task_running("bot-dispatcher", True)
+                else:
+                    runtime_health.mark_task_failed(
+                        "bot-dispatcher",
+                        True,
+                        "Pyrogram dispatcher worker stopped",
+                    )
+
+                if runtime_health.bot_backoff_remaining() == 0:
+                    try:
+                        await asyncio.wait_for(bot_client.get_me(), timeout=15)
+                        runtime_health.mark_bot_rpc_ok()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # pylint: disable=broad-except
+                        runtime_health.record_error(f"bot client health: {exc}")
+                        logger.warning("Bot client health check failed: {}", exc)
+
+        cleanup_download_result()
+        _compact_finished_initial_state()
+        await asyncio.sleep(30)
 
 
 async def run_until_all_task_finish():
@@ -643,7 +823,12 @@ async def stop_server(client: pyrogram.Client):
     """
     Stop the server using the provided client.
     """
-    await client.stop()
+    if not getattr(client, "is_connected", False):
+        return
+    try:
+        await client.stop()
+    except ConnectionError:
+        pass
 
 
 def main():
@@ -664,18 +849,45 @@ def main():
 
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
 
+        runtime_health.configure(require_bot=bool(app.bot_token))
         app.loop.run_until_complete(start_server(client))
+        runtime_health.mark_user_rpc_ok()
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
 
-        app.loop.create_task(download_all_chat(client))
-        for _ in range(app.max_download_task):
-            task = app.loop.create_task(worker(client))
-            tasks.append(task)
+        tasks.append(
+            create_supervised_task(
+                app.loop,
+                lambda: download_all_chat(client),
+                "initial-chat-scan",
+                restart=False,
+                critical=False,
+            )
+        )
+        for worker_id in range(app.max_download_task):
+            tasks.append(
+                create_supervised_task(
+                    app.loop,
+                    lambda: worker(client),
+                    f"download-worker-{worker_id}",
+                    restart=True,
+                    critical=True,
+                )
+            )
 
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
+
+        tasks.append(
+            create_supervised_task(
+                app.loop,
+                lambda: health_monitor(client),
+                "health-monitor",
+                restart=True,
+                critical=True,
+            )
+        )
         _exec_loop()
     except KeyboardInterrupt:
         logger.info(_t("KeyboardInterrupt"))
@@ -683,11 +895,11 @@ def main():
         logger.exception("{}", e)
     finally:
         app.is_running = False
+        for task in tasks:
+            task.cancel()
         if app.bot_token:
             app.loop.run_until_complete(stop_download_bot())
         app.loop.run_until_complete(stop_server(client))
-        for task in tasks:
-            task.cancel()
         logger.info(_t("Stopped!"))
         # check_for_updates(app.proxy)
         logger.info(f"{_t('update config')}......")

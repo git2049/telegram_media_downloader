@@ -8,7 +8,7 @@ from typing import Callable, List, Union
 import pyrogram
 from loguru import logger
 from pyrogram import types
-from pyrogram.handlers import CallbackQueryHandler, MessageHandler
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler, RawUpdateHandler
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from ruamel import yaml
 
@@ -23,10 +23,12 @@ from module.app import (
     TaskType,
     UploadStatus,
 )
+from module.download_stat import remove_task_results
 from module.filter import Filter
 from module.get_chat_history_v2 import get_chat_history_v2
 from module.language import Language, _t
 from module.pyrogram_extension import (
+    HookClient,
     check_user_permission,
     get_utf16_length,
     parse_link,
@@ -37,10 +39,29 @@ from module.pyrogram_extension import (
     set_meta_data,
     upload_telegram_chat_message,
 )
+from module.runtime_health import create_supervised_task, runtime_health
 from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
 # pylint: disable = C0301, R0902
+
+
+async def mark_bot_update(_, __, ___, ____):
+    """Record that the bot dispatcher is still receiving updates."""
+    runtime_health.mark_bot_update()
+
+
+class BotHookClient(HookClient):
+    """HookClient that exposes all bot FloodWait responses to runtime health."""
+
+    # pylint: disable=arguments-differ
+    async def invoke(self, *args, **kwargs):
+        """Invoke Telegram RPC and surface long FloodWait state globally."""
+        try:
+            return await super().invoke(*args, **kwargs)
+        except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
+            runtime_health.set_bot_backoff(wait_err.value)
+            raise
 
 
 class DownloadBot:
@@ -53,6 +74,7 @@ class DownloadBot:
         self.download_chat_task: Callable = None
         self.app = None
         self.listen_forward_chat: dict = {}
+        self.listen_forward_last_message_ids: dict = {}
         self.config: dict = {}
         self._yaml = yaml.YAML()
         self.config_path = os.path.join(os.path.abspath("."), "bot.yaml")
@@ -81,8 +103,14 @@ class DownloadBot:
         self.task_node[node.task_id] = node
 
     def remove_task_node(self, task_id: int):
-        """Remove task node"""
-        self.task_node.pop(task_id)
+        """Remove a completed task node and release runtime caches."""
+        node = self.task_node.pop(task_id, None)
+        if not node:
+            return
+        node.upload_stat_dict.clear()
+        node.cloud_drive_upload_stat_dict.clear()
+        node.media_group_ids.clear()
+        remove_task_results(task_id)
 
     def stop_task(self, task_id: str):
         """Stop task"""
@@ -98,16 +126,22 @@ class DownloadBot:
                 return
 
     async def update_reply_message(self):
-        """Update reply message"""
+        """Update reply messages without allowing one task to kill the loop."""
         while self.is_running:
-            for key, value in self.task_node.copy().items():
-                if value.is_running:
-                    await report_bot_status(self.bot, value)
+            try:
+                for _, value in self.task_node.copy().items():
+                    if value.is_running:
+                        await report_bot_status(self.bot, value)
 
-            for key, value in self.task_node.copy().items():
-                if value.is_running and value.is_finish():
-                    self.remove_task_node(key)
-            await asyncio.sleep(3)
+                for key, value in self.task_node.copy().items():
+                    if value.is_running and value.is_finish():
+                        self.remove_task_node(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Bot reply updater error: {}", exc)
+                runtime_health.record_error(f"bot reply updater: {exc}")
+            await asyncio.sleep(5)
 
     def assign_config(self, _config: dict):
         """assign config from str.
@@ -123,14 +157,21 @@ class DownloadBot:
         """
 
         self.download_filter = _config.get("download_filter", self.download_filter)
+        self.listen_forward_last_message_ids = _config.get(
+            "listen_forward_last_message_ids",
+            self.listen_forward_last_message_ids,
+        )
 
         return True
 
     def update_config(self):
-        """Update config from str."""
+        """Persist bot runtime configuration."""
         self.config["download_filter"] = self.download_filter
+        self.config[
+            "listen_forward_last_message_ids"
+        ] = self.listen_forward_last_message_ids
 
-        with open("d", "w", encoding="utf-8") as yaml_file:
+        with open(self.config_path, "w", encoding="utf-8") as yaml_file:
             self._yaml.dump(self.config, yaml_file)
 
     async def start(
@@ -141,13 +182,14 @@ class DownloadBot:
         download_chat_task: Callable,
     ):
         """Start bot"""
-        self.bot = pyrogram.Client(
+        self.bot = BotHookClient(
             app.application_name + "_bot",
             api_hash=app.api_hash,
             api_id=app.api_id,
             bot_token=app.bot_token,
             workdir=app.session_file_path,
             proxy=app.proxy,
+            start_timeout=app.start_timeout,
         )
 
         # Command list
@@ -198,6 +240,7 @@ class DownloadBot:
         await self.bot.start()
 
         self.bot_info = await self.bot.get_me()
+        runtime_health.mark_bot_rpc_ok()
 
         for allowed_user_id in self.app.allowed_user_ids:
             try:
@@ -210,6 +253,7 @@ class DownloadBot:
         self.allowed_user_ids.append(admin.id)
 
         await self.bot.set_bot_commands(commands)
+        self.bot.add_handler(RawUpdateHandler(mark_bot_update), group=-100)
 
         self.bot.add_handler(
             MessageHandler(
@@ -301,7 +345,13 @@ class DownloadBot:
         except Exception:
             pass
 
-        self.reply_task = _bot.app.loop.create_task(_bot.update_reply_message())
+        self.reply_task = create_supervised_task(
+            _bot.app.loop,
+            lambda: _bot.update_reply_message(),
+            "bot-reply-updater",
+            restart=True,
+            critical=True,
+        )
 
         self.bot.add_handler(
             MessageHandler(
@@ -315,6 +365,11 @@ class DownloadBot:
 _bot = DownloadBot()
 
 
+def get_download_bot_client():
+    """Return the active bot client for runtime health probes."""
+    return _bot.bot
+
+
 async def start_download_bot(
     app: Application,
     client: pyrogram.Client,
@@ -326,14 +381,21 @@ async def start_download_bot(
 
 
 async def stop_download_bot():
-    """Stop download bot"""
-    _bot.update_config()
+    """Stop download bot without masking an earlier startup/runtime failure."""
+    try:
+        _bot.update_config()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Failed to persist bot config during shutdown: {}", exc)
+
     _bot.is_running = False
     if _bot.reply_task:
         _bot.reply_task.cancel()
     _bot.stop_task("all")
-    if _bot.bot:
-        await _bot.bot.stop()
+    if _bot.bot and getattr(_bot.bot, "is_connected", False):
+        try:
+            await _bot.bot.stop()
+        except ConnectionError:
+            pass
     if _bot.monitor_task:
         _bot.monitor_task.cancel()
         _bot.monitor_task = None
@@ -831,8 +893,10 @@ async def direct_download(
     await _bot.add_download_task(
         download_message,
         node,
+        priority=0,
     )
 
+    node.collection_complete = True
     node.is_running = True
 
 
@@ -900,7 +964,7 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
             if download_message:
                 await direct_download(_bot, entity.id, message, download_message)
             else:
-                client.send_message(
+                await client.send_message(
                     message.from_user.id,
                     f"{_t('From')} {entity.title} {_t('download')} {message_id} {_t('error')}!",
                     reply_to_message_id=message.id,
@@ -992,9 +1056,26 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
                 task_id=_bot.gen_task_id(),
             )
             _bot.add_task_node(node)
-            _bot.app.loop.create_task(
-                _bot.download_chat_task(_bot.client, chat_download_config, node)
-            )
+            async def run_download_discovery():
+                """Run finite message discovery and always close collection state."""
+                try:
+                    await _bot.download_chat_task(
+                        _bot.client, chat_download_config, node
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        "Bot download discovery {} failed: {}", node.task_id, exc
+                    )
+                    runtime_health.record_error(
+                        f"bot download discovery {node.task_id}: {exc}"
+                    )
+                finally:
+                    node.collection_complete = True
+                    node.is_running = True
+
+            _bot.app.loop.create_task(run_download_discovery())
     except Exception as e:
         await client.send_message(
             message.from_user.id,
@@ -1289,7 +1370,7 @@ async def check_new_messages(
             if message.id > last_message_id:
                 if not node.has_protected_content:
                     await forward_normal_content(client, node, message)
-                    await report_bot_status(client, node, immediate_reply=True)
+                    await report_bot_status(client, node)
                 else:
                     await _bot.add_download_task(message, node)
                 last_message_id = message.id
@@ -1299,29 +1380,44 @@ async def check_new_messages(
     return last_message_id
 
 
+async def _poll_listen_forward_chat(chat_id: int, node: TaskNode):
+    """Poll one listen-forward chat without blocking other monitored chats."""
+    cursor_key = str(chat_id)
+    last_id = int(_bot.listen_forward_last_message_ids.get(cursor_key, 0))
+    new_last_id = await check_new_messages(
+        _bot.client, chat_id, node, last_id
+    )
+    return cursor_key, last_id, new_last_id
+
+
 async def start_message_monitor():
     """
-    Starts monitoring all chats that need to be forwarded.
-    Runs every 60 seconds to check for new messages.
+    Monitor forwarding chats and persist cursors so restarts do not lose messages.
     """
-    last_message_ids = {}  # 存储每个聊天的最后处理的消息ID
-
     while _bot.is_running:
+        changed = False
         try:
-            for chat_id, node in _bot.listen_forward_chat.items():
-                if not node.is_running:
-                    continue
+            polls = [
+                _poll_listen_forward_chat(chat_id, node)
+                for chat_id, node in _bot.listen_forward_chat.items()
+                if node.is_running
+            ]
+            results = await asyncio.gather(*polls) if polls else []
 
-                last_id = last_message_ids.get(chat_id, 0)
-                new_last_id = await check_new_messages(
-                    _bot.client, chat_id, node, last_id
-                )
-                last_message_ids[chat_id] = new_last_id
+            for cursor_key, last_id, new_last_id in results:
+                if new_last_id != last_id:
+                    _bot.listen_forward_last_message_ids[cursor_key] = new_last_id
+                    changed = True
 
-        except Exception as e:
-            logger.exception(f"Error in message monitor: {e}")
+            if changed:
+                _bot.update_config()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Error in message monitor: {}", exc)
+            runtime_health.record_error(f"message monitor: {exc}")
 
-        await asyncio.sleep(60)  # 每60秒检查一次
+        await asyncio.sleep(60)
 
 
 async def set_listen_forward_msg(
@@ -1363,7 +1459,13 @@ async def set_listen_forward_msg(
     _bot.listen_forward_chat[node.chat_id] = node
 
     if not hasattr(_bot, "monitor_task") or _bot.monitor_task is None:
-        _bot.monitor_task = _bot.app.loop.create_task(start_message_monitor())
+        _bot.monitor_task = create_supervised_task(
+            _bot.app.loop,
+            start_message_monitor,
+            "listen-forward-monitor",
+            restart=True,
+            critical=True,
+        )
 
 
 async def stop(client: pyrogram.Client, message: pyrogram.types.Message):
