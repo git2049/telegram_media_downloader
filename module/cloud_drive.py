@@ -106,14 +106,19 @@ class CloudDrive:
                 + "/"
             ).replace("\\", "/")
 
+            loop = asyncio.get_running_loop()
             if not drive_config.dir_cache.get(remote_dir):
-                CloudDrive.rclone_mkdir(drive_config, remote_dir)
+                await loop.run_in_executor(
+                    None, CloudDrive.rclone_mkdir, drive_config, remote_dir
+                )
                 drive_config.dir_cache[remote_dir] = True
 
             zip_file_path: str = ""
             file_path = local_file_path
             if drive_config.before_upload_file_zip:
-                zip_file_path = CloudDrive.zip_file(local_file_path)
+                zip_file_path = await loop.run_in_executor(
+                    None, CloudDrive.zip_file, local_file_path
+                )
                 file_path = zip_file_path
             else:
                 file_path = local_file_path

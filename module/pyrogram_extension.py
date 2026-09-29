@@ -39,6 +39,7 @@ from module.app import (
 )
 from module.download_stat import get_download_result
 from module.language import Language, _t
+from module.runtime_health import runtime_health
 from module.send_media_group_v2 import cache_media, send_media_group_v2
 from utils.format import (
     create_progress_bar,
@@ -50,7 +51,9 @@ from utils.meta_data import MetaData
 
 _mimetypes = MimeTypes()
 _mimetypes.readfp(StringIO(mime_types))
-_download_cache = Cache(1024 * 1024 * 1024)
+DOWNLOAD_STATUS_CACHE_SIZE = 100000
+MAX_SAFE_FLOOD_WAIT = 60
+_download_cache = Cache(DOWNLOAD_STATUS_CACHE_SIZE)
 
 
 def reset_download_cache():
@@ -981,7 +984,7 @@ async def proc_cache_forward(
 
 
 def record_download_status(func):
-    """Record download status"""
+    """Record download status and never leave an exception stuck as Downloading."""
 
     @wraps(func)
     async def inner(
@@ -991,14 +994,33 @@ def record_download_status(func):
         file_formats: dict,
         node: TaskNode,
     ):
-        if _download_cache[(node.chat_id, message.id)] is DownloadStatus.Downloading:
+        cache_key = (node.chat_id, message.id)
+        if _download_cache[cache_key] is DownloadStatus.Downloading:
             return DownloadStatus.Downloading, None
 
-        _download_cache[(node.chat_id, message.id)] = DownloadStatus.Downloading
+        _download_cache[cache_key] = DownloadStatus.Downloading
+        status = DownloadStatus.FailedDownload
+        file_name = None
 
-        status, file_name = await func(client, message, media_types, file_formats, node)
-
-        _download_cache[(node.chat_id, message.id)] = status
+        try:
+            status, file_name = await func(
+                client, message, media_types, file_formats, node
+            )
+        except asyncio.CancelledError:
+            _download_cache.store.pop(cache_key, None)
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception(
+                "Download wrapper error for message {}: {}", message.id, exc
+            )
+            runtime_health.record_error(
+                f"download wrapper message {message.id}: {exc}"
+            )
+            status = DownloadStatus.FailedDownload
+            file_name = None
+        finally:
+            if cache_key in _download_cache.store:
+                _download_cache[cache_key] = status
 
         return status, file_name
 
@@ -1052,11 +1074,19 @@ async def report_bot_status(
     node: TaskNode,
     immediate_reply=False,
 ):
-    """see _report_bot_status"""
+    """Report bot status while respecting Telegram FloodWait backoff."""
     try:
         return await _report_bot_status(client, node, immediate_reply)
-    except Exception as e:
-        logger.debug(f"{e}")
+    except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
+        runtime_health.set_bot_backoff(wait_err.value)
+        logger.warning(
+            "Bot status updates paused for {} seconds due to FloodWait",
+            wait_err.value,
+        )
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug(f"{exc}")
+        return None
 
 
 async def _report_bot_status(
@@ -1076,6 +1106,9 @@ async def _report_bot_status(
         None
     """
     if not node.reply_message_id or not node.bot:
+        return
+
+    if runtime_health.bot_backoff_remaining() > 0:
         return
 
     if immediate_reply or node.can_reply():
@@ -1172,13 +1205,14 @@ async def _report_bot_status(
         )
 
         if new_msg_str != node.last_edit_msg:
-            node.last_edit_msg = new_msg_str
             await client.edit_message_text(
                 node.from_user_id,
                 node.reply_message_id,
                 new_msg_str,
                 parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
             )
+            node.last_edit_msg = new_msg_str
+            runtime_health.mark_bot_rpc_ok()
 
 
 def set_max_concurrent_transmissions(
@@ -1195,19 +1229,54 @@ def set_max_concurrent_transmissions(
         )
 
 
-async def fetch_message(client: pyrogram.Client, message: pyrogram.types.Message):
-    """
-    This function retrieves a message from a specified chat using the Pyrogram library.
-     Args:
-        client (pyrogram.Client): A client instance created using Pyrogram.
-        message (pyrogram.types.Message): A message instance returned from Pyrogram.
-     Returns:
-        pyrogram.types.Message: A message object retrieved from the specified chat.
-    """
-    return await client.get_messages(
-        chat_id=message.chat.id,
-        message_ids=message.id,
-    )
+async def fetch_message(
+    client: pyrogram.Client,
+    message: pyrogram.types.Message,
+    max_attempts: int = 3,
+    wait_second: int = 2,
+):
+    """Refetch a message with bounded retries for transient connection failures."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await client.get_messages(
+                chat_id=message.chat.id,
+                message_ids=message.id,
+            )
+            runtime_health.mark_user_rpc_ok()
+            return result
+        except asyncio.CancelledError:
+            raise
+        except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
+            logger.warning(
+                "Fetch message[{}] FloodWait {}s", message.id, wait_err.value
+            )
+            if wait_err.value > MAX_SAFE_FLOOD_WAIT:
+                runtime_health.record_error(
+                    f"fetch message {message.id} FloodWait {wait_err.value}s"
+                )
+                return None
+            await asyncio.sleep(wait_err.value)
+        except (OSError, TimeoutError, ConnectionError) as exc:
+            runtime_health.record_error(f"fetch message {message.id}: {exc}")
+            if attempt == max_attempts:
+                logger.error(
+                    "Fetch message[{}] failed after {} attempts: {}",
+                    message.id,
+                    max_attempts,
+                    exc,
+                )
+                return None
+            await asyncio.sleep(wait_second * attempt)
+        except pyrogram.errors.RPCError as exc:
+            logger.warning("Fetch message[{}] RPC error: {}", message.id, exc)
+            runtime_health.record_error(f"fetch message {message.id}: {exc}")
+            return None
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Fetch message[{}] failed: {}", message.id, exc)
+            runtime_health.record_error(f"fetch message {message.id}: {exc}")
+            return None
+
+    return None
 
 
 async def retry(func: Callable, args: tuple = (), max_attempts=3, wait_second=15):
@@ -1231,6 +1300,11 @@ async def retry(func: Callable, args: tuple = (), max_attempts=3, wait_second=15
             return await func(*args)
         except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
             logger.warning("bad call retry: FlowWait {}", wait_err.value)
+            if wait_err.value > MAX_SAFE_FLOOD_WAIT:
+                runtime_health.record_error(
+                    f"retry FloodWait exceeded safe wait: {wait_err.value}s"
+                )
+                return None
             await asyncio.sleep(wait_err.value)
         except Exception as e:
             logger.exception("Error: {}", e)
@@ -1364,6 +1438,7 @@ async def update_cloud_upload_stat(
     Returns:
         None
     """
+    runtime_health.mark_worker_progress()
     node.cloud_drive_upload_stat_dict[message_id] = CloudDriveUploadStat(
         file_name=file_name,
         transferred=transferred,
@@ -1385,6 +1460,7 @@ async def update_upload_stat(
 ):
     """update_upload_status"""
     cur_time = time.time()
+    runtime_health.mark_worker_progress()
 
     if node.is_stop_transmission:
         client.stop_transmission()

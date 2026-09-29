@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from typing import Callable, List, Optional, Union
 
 from loguru import logger
@@ -20,6 +21,7 @@ from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
 _yaml = yaml.YAML()
+CAPTION_CACHE_MAX_PER_CHAT = 2000
 # pylint: disable = R0902
 
 
@@ -155,6 +157,7 @@ class TaskNode:
         self.success_download_task = 0
         self.skip_download_task = 0
         self.last_reply_time = time.time()
+        self.reply_interval = 5.0
         self.last_edit_msg: str = ""
         self.total_download_byte = 0
         self.forward_msg_detail_str: str = ""
@@ -164,6 +167,7 @@ class TaskNode:
         self.failed_forward_task: int = 0
         self.skip_forward_task: int = 0
         self.is_running: bool = False
+        self.collection_complete: bool = False
         self.client = None
         self.upload_success_count: int = 0
         self.is_stop_transmission = False
@@ -190,6 +194,7 @@ class TaskNode:
         """If is finish"""
         return self.is_stop_transmission or (
             self.is_running
+            and self.collection_complete
             and self.task_type != TaskType.ListenForward
             and self.total_task == self.total_download_task
         )
@@ -232,11 +237,11 @@ class TaskNode:
             based on the time elapsed since the last reply.
 
         Returns:
-            True if the time elapsed since
-                the last reply is greater than 1 second, False otherwise.
+            True if the configured reply interval has elapsed,
+                False otherwise.
         """
         cur_time = time.time()
-        if cur_time - self.last_reply_time > 1.0:
+        if cur_time - self.last_reply_time > self.reply_interval:
             self.last_reply_time = cur_time
             return True
 
@@ -705,12 +710,13 @@ class Application:
                 progress_args,
             )
         elif self.cloud_drive_config.upload_adapter == "aligo":
-            ret = await self.loop.run_in_executor(
-                self.executor,
-                CloudDrive.aligo_upload_file(
-                    self.cloud_drive_config, self.save_path, local_file_path
-                ),
+            upload_call = partial(
+                CloudDrive.aligo_upload_file,
+                self.cloud_drive_config,
+                self.save_path,
+                local_file_path,
             )
+            ret = await self.loop.run_in_executor(self.executor, upload_call)
 
         return ret
 
@@ -973,6 +979,10 @@ class Application:
         else:
             self.caption_name_dict[chat_id] = {media_group_id: caption}
 
+        while len(self.caption_name_dict[chat_id]) > CAPTION_CACHE_MAX_PER_CHAT:
+            oldest_group_id = next(iter(self.caption_name_dict[chat_id]))
+            self.caption_name_dict[chat_id].pop(oldest_group_id, None)
+
     def get_caption_name(
         self, chat_id: Union[int, str], media_group_id: Optional[str]
     ) -> Optional[str]:
@@ -1006,6 +1016,10 @@ class Application:
             self.caption_entities_dict[chat_id][media_group_id] = caption_entities
         else:
             self.caption_entities_dict[chat_id] = {media_group_id: caption_entities}
+
+        while len(self.caption_entities_dict[chat_id]) > CAPTION_CACHE_MAX_PER_CHAT:
+            oldest_group_id = next(iter(self.caption_entities_dict[chat_id]))
+            self.caption_entities_dict[chat_id].pop(oldest_group_id, None)
 
     def get_caption_entities(
         self, chat_id: Union[int, str], media_group_id: Optional[str]
